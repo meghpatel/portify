@@ -138,6 +138,11 @@ you can host for free on GitHub Pages.
 bash release.sh 1.0.1     # bumps, tags, builds, prints sha256
 ```
 
+> **Next up — `--set-port`.** The new `portify --set-port <project> <path>`
+> command (writes a project's allocated port into its `package.json` / vite
+> config) is a new feature, so cut it as a **minor** bump:
+> `bash release.sh 1.1.0`.
+
 Then:
 - attach the new `.deb` to the new GitHub Release,
 - copy the updated `packaging/homebrew/portify.rb` into `homebrew-tap`, push,

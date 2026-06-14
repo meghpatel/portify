@@ -8,6 +8,7 @@
 #   portify --add 9000 "My service"       add a manual entry
 #   portify --allocate MarsQ              hash project name -> assign a port -> save it
 #   portify --allocate MarsQ --quiet      print only the allocated port (for scripts)
+#   portify --set-port MarsQ ./marsq      write MarsQ's allocated port into its package.json/vite config
 #   portify --whois 20667                 reverse lookup: port -> project name
 #   portify --scan                        preview ports currently listening on this machine
 #   portify --scan --apply                import any new listening ports into the registry
@@ -176,6 +177,133 @@ cmd_allocate() {
   fi
 }
 
+# ── set-port: write a project's allocated port into its project config ────────
+# Looks up the port already allocated to <project>, then edits the target so the
+# dev server uses it. The target may be a package.json, a vite.config.*, or a
+# directory containing one (vite config is preferred when both exist).
+
+# Find the port allocated to a project name (exact, case-insensitive match).
+port_for_project() {
+  local project_lower
+  project_lower=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  grep -iE "^[0-9]+:[[:space:]]+${project_lower}[[:space:]]*$" "$PORTS_FILE" \
+    | sed -E 's/^([0-9]+):.*/\1/' | head -1
+}
+
+# Resolve the file to edit from a path that may be a file or a directory.
+resolve_target() {
+  local path="$1" f
+  if [[ -d "$path" ]]; then
+    for f in vite.config.ts vite.config.js vite.config.mjs vite.config.mts vite.config.cjs vite.config.cts; do
+      [[ -f "$path/$f" ]] && { echo "$path/$f"; return 0; }
+    done
+    [[ -f "$path/package.json" ]] && { echo "$path/package.json"; return 0; }
+    return 1
+  fi
+  [[ -f "$path" ]] && { echo "$path"; return 0; }
+  return 1
+}
+
+# Set server.port in a vite config. Handles three cases: an existing numeric
+# port, an existing server block (no port), or neither. Edits in place via a
+# temp file; returns non-zero if it couldn't find a place to write.
+set_vite_port() {
+  local file="$1" port="$2" tmp
+  tmp=$(mktemp) || return 1
+
+  if grep -qE '(^|[^[:alnum:]_])port[[:space:]]*:[[:space:]]*[0-9]+' "$file"; then
+    # Replace the first existing `port: <number>`.
+    awk -v p="$port" '
+      !done && match($0, /(^|[^[:alnum:]_])port[[:space:]]*:[[:space:]]*[0-9]+/) {
+        pre=substr($0,1,RSTART-1); m=substr($0,RSTART,RLENGTH); post=substr($0,RSTART+RLENGTH)
+        sub(/[0-9]+/, p, m); $0=pre m post; done=1
+      }
+      { print }
+    ' "$file" > "$tmp"
+  elif grep -qE 'server[[:space:]]*:[[:space:]]*\{' "$file"; then
+    # Insert `port:` right after the opening brace of the server block.
+    awk -v p="$port" '
+      !done && match($0, /server[[:space:]]*:[[:space:]]*\{/) {
+        idx=RSTART+RLENGTH
+        $0=substr($0,1,idx-1) "\n    port: " p "," substr($0,idx); done=1
+      }
+      { print }
+    ' "$file" > "$tmp"
+  else
+    # No server block — insert one right after the config object opening brace.
+    awk -v p="$port" '
+      !done && match($0, /(defineConfig[[:space:]]*\([[:space:]]*\{|export[[:space:]]+default[[:space:]]*\{)/) {
+        idx=RSTART+RLENGTH
+        $0=substr($0,1,idx-1) "\n  server: { port: " p " }," substr($0,idx); done=1
+      }
+      { print }
+      END { if (!done) exit 3 }
+    ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+  fi
+
+  mv "$tmp" "$file"
+}
+
+# Inject/replace `--port <n>` in the dev-style scripts of a package.json.
+# Preserves the file's existing formatting; returns non-zero if no such script.
+set_pkg_port() {
+  local file="$1" port="$2" tmp
+  tmp=$(mktemp) || return 1
+  awk -v p="$port" '
+    {
+      line=$0
+      # Only touch dev-style scripts that actually invoke vite, so unrelated
+      # "start": "node server.js" style scripts are left alone.
+      if (line ~ /"(dev|preview|start|serve)"[[:space:]]*:[[:space:]]*"/ && line ~ /(^|[^[:alnum:]])vite([^[:alnum:]]|$)/) {
+        if (line ~ /--port[ =][0-9]+/) {
+          sub(/--port[ =][0-9]+/, "--port " p, line)
+        } else {
+          lq=0
+          for (i=length(line); i>=1; i--) { if (substr(line,i,1)=="\"") { lq=i; break } }
+          if (lq>0) line=substr(line,1,lq-1) " --port " p substr(line,lq)
+        }
+        changed=1
+      }
+      print line
+    }
+    END { if (!changed) exit 3 }
+  ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$file"
+}
+
+cmd_set_port() {
+  local project="$1" path="$2"
+  [[ -z "$project" || -z "$path" ]] \
+    && die "Usage: portify --set-port <project> <path-to-project|package.json|vite.config>"
+  ensure_file
+
+  local port
+  port=$(port_for_project "$project")
+  [[ -n "$port" ]] || die "No port allocated to '$project'. Run: ${BOLD}portify --allocate $project${RESET}"
+
+  local target
+  target=$(resolve_target "$path") \
+    || die "Couldn't find a package.json or vite.config.* at: $path"
+
+  case "$(basename "$target")" in
+    package.json)
+      set_pkg_port "$target" "$port" \
+        || die "No vite dev/preview/start/serve script in $target to set a port on."
+      echo -e "${GREEN}Set port:${RESET} ${BOLD}$project${RESET} → ${CYAN}$port${RESET}"
+      echo -e "  Updated dev script in ${target}"
+      ;;
+    vite.config.*)
+      set_vite_port "$target" "$port" \
+        || die "Couldn't write server.port into $target — add ${BOLD}server: { port: $port }${RESET} manually."
+      echo -e "${GREEN}Set port:${RESET} ${BOLD}$project${RESET} → ${CYAN}$port${RESET}"
+      echo -e "  Updated server.port in ${target}"
+      ;;
+    *)
+      die "Unsupported target '$(basename "$target")' — expected package.json or vite.config.*"
+      ;;
+  esac
+}
+
 # ── whois: reverse lookup — port -> project name ─────────────────────────────
 cmd_whois() {
   local port="$1"
@@ -275,6 +403,7 @@ ${BOLD}Usage:${RESET}
   portify --list                       Show all registered ports
   portify --add <port> "desc"          Add a manual entry
   portify --allocate <project> [-q]    Auto-assign a port to a project (hash-based)
+  portify --set-port <project> <path>  Write a project's allocated port into its config
   portify --whois <port>               Reverse lookup: port -> project name
   portify --scan [--apply]             Discover (and optionally import) listening ports
   portify --init                       Create an empty registry
@@ -287,6 +416,15 @@ ${BOLD}Allocate algorithm:${RESET}
   Use --quiet/-q to print just the number, e.g. in package.json scripts:
     "dev": "vite --port \$(portify --allocate MyApp --quiet)"
 
+${BOLD}Set-port:${RESET}
+  Bakes a project's allocated port into its config so it's not computed at runtime.
+  Allocate first, then point --set-port at the project dir (or its file):
+    portify --allocate MarsQ
+    portify --set-port MarsQ ./marsq
+  The path may be a directory (vite.config.* preferred, else package.json), a
+  vite.config.{ts,js,mjs,...} (sets server.port), or a package.json (adds
+  --port to the vite dev/preview/start/serve scripts). Re-running is idempotent.
+
 ${BOLD}Config:${RESET}
   Registry file: ${PORTS_FILE}
   Override:      export PORTS_FILE=~/path/to/ports.yaml
@@ -298,6 +436,7 @@ case "${1:-}" in
   --list)            cmd_list ;;
   --add)             cmd_add "$2" "$3" ;;
   --allocate)        cmd_allocate "$2" "$3" ;;
+  --set-port)        cmd_set_port "$2" "$3" ;;
   --whois)           cmd_whois "$2" ;;
   --scan)            cmd_scan "$2" ;;
   --init)            cmd_init ;;
