@@ -22,7 +22,7 @@
 
 set -o pipefail
 
-PORTIFY_VERSION="1.0.1"
+PORTIFY_VERSION="1.1.0"
 PORTS_FILE="${PORTS_FILE:-$HOME/.ports/ports.yaml}"
 
 # ── colours (disabled automatically when not writing to a terminal) ───────────

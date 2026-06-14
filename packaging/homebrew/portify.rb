@@ -7,10 +7,10 @@
 class Portify < Formula
   desc "Port registry lookup, allocation, and scanning CLI"
   homepage "https://github.com/meghpatel/portify"
-  url "https://github.com/meghpatel/portify/archive/refs/tags/v1.0.1.tar.gz"
-  sha256 "e917f5a471887c67bb39e162a0edf56f6918f746e92b0406409688f1e609e3cb"
+  url "https://github.com/meghpatel/portify/archive/refs/tags/v1.1.0.tar.gz"
+  sha256 "ce926ca30f41b87925c10c3f70e0577a2c2af34ec30d70238257e7e36661d285"
   license "MIT"
-  version "1.0.1"
+  version "1.1.0"
 
   def install
     bin.install "portify"
