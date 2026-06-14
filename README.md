@@ -61,6 +61,7 @@ portify --scan --apply
 | `portify --list` | Show all registered ports |
 | `portify --add <port> "desc"` | Add a manual entry |
 | `portify --allocate <project> [-q]` | Hash a project name to a stable port and save it |
+| `portify --set-port <project> <path>` | Write a project's allocated port into its `package.json` / vite config |
 | `portify --whois <port>` | Reverse lookup: port → project |
 | `portify --scan [--apply]` | Discover (and optionally import) listening ports |
 | `portify --init` | Create an empty registry |
@@ -80,6 +81,29 @@ Wire it into a project so the port is never hardcoded:
   "dev": "vite --port $(portify --allocate MarsQ --quiet)"
 }
 ```
+
+## Wiring the port into a project (`--set-port`)
+
+The `--quiet` form above computes the port at runtime. If you'd rather **bake**
+the allocated port straight into a project's config, allocate it once and then
+point `--set-port` at the project:
+
+```bash
+portify --allocate MarsQ          # 20667 → MarsQ
+portify --set-port MarsQ ./marsq  # writes 20667 into ./marsq's config
+```
+
+The path can be a **directory** (it prefers `vite.config.*`, otherwise
+`package.json`) or a **file**:
+
+- **`vite.config.{ts,js,mjs,…}`** — sets `server.port`, inserting a `server`
+  block if one doesn't exist yet.
+- **`package.json`** — appends (or updates) `--port <n>` on the `dev`,
+  `preview`, `start`, and `serve` scripts that invoke `vite`, preserving your
+  existing formatting. Non-vite scripts are left untouched.
+
+It reads the port already assigned to the project in the registry, so the name
+must be allocated first. Re-running is idempotent.
 
 ## Registry
 
