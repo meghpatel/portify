@@ -1,0 +1,13 @@
+Package: portify
+Version: __VERSION__
+Section: utils
+Priority: optional
+Architecture: all
+Depends: bash (>= 4.0)
+Recommends: lsof | iproute2
+Maintainer: Megh Patel <patel.megh09@gmail.com>
+Homepage: https://github.com/meghpatel/portify
+Description: Port registry lookup, allocation, and scanning CLI
+ portify reads a simple ports.yaml registry and lets you look up,
+ list, allocate (hash-based), and reverse-look-up ports. It can also
+ scan the machine for listening ports and import them automatically.

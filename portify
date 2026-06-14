@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+# portify — look up, allocate, and scan ports in your registry
+#
+# Usage:
+#   portify 5000                          look up a port
+#   portify 5000 --live                   look up + check if something is running on it
+#   portify --list                        show all registered ports
+#   portify --add 9000 "My service"       add a manual entry
+#   portify --allocate MarsQ              hash project name -> assign a port -> save it
+#   portify --allocate MarsQ --quiet      print only the allocated port (for scripts)
+#   portify --whois 20667                 reverse lookup: port -> project name
+#   portify --scan                        preview ports currently listening on this machine
+#   portify --scan --apply                import any new listening ports into the registry
+#   portify --init                        create an empty registry if one doesn't exist
+#   portify --version                     print version
+#   portify --help                        usage info
+#
+# Config:
+#   PORTS_FILE   path to the registry (default: ~/.ports/ports.yaml)
+#                override with:  export PORTS_FILE=~/path/to/ports.yaml
+
+set -o pipefail
+
+PORTIFY_VERSION="1.0.0"
+PORTS_FILE="${PORTS_FILE:-$HOME/.ports/ports.yaml}"
+
+# ── colours (disabled automatically when not writing to a terminal) ───────────
+if [[ -t 1 ]]; then
+  RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
+  CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+else
+  RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; RESET=''
+fi
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+die() { echo -e "${RED}Error:${RESET} $*" >&2; exit 1; }
+
+# Auto-create the registry on first use so there's no manual setup step.
+ensure_file() {
+  if [[ ! -f "$PORTS_FILE" ]]; then
+    mkdir -p "$(dirname "$PORTS_FILE")" 2>/dev/null \
+      || die "Could not create directory for $PORTS_FILE"
+    : > "$PORTS_FILE" || die "Could not create registry at $PORTS_FILE"
+    [[ -t 2 ]] && echo -e "${YELLOW}Created new registry:${RESET} $PORTS_FILE" >&2
+  fi
+}
+
+# Parse "5000: FastAPI backend" -> just the description after the colon
+lookup() {
+  local port="$1"
+  grep -E "^\"?${port}\"?[[:space:]]*:" "$PORTS_FILE" \
+    | sed -E "s/^\"?${port}\"?[[:space:]]*:[[:space:]]*//" \
+    | head -1
+}
+
+live_check() {
+  local port="$1" proc=""
+  if command -v lsof &>/dev/null; then
+    proc=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $1" (PID "$2")"}')
+  elif command -v ss &>/dev/null; then
+    proc=$(ss -tlnpH "sport = :$port" 2>/dev/null \
+      | grep -oE 'users:\(\("[^"]+' | head -1 | sed -E 's/.*"//')
+  fi
+  if [[ -n "$proc" ]]; then
+    echo -e "  ${GREEN}● Live:${RESET} $proc is listening"
+  else
+    echo -e "  ${YELLOW}○ Not running${RESET} (nothing bound to :$port right now)"
+  fi
+}
+
+# ── check: look up a single port ──────────────────────────────────────────────
+cmd_check() {
+  local port="$1" do_live="$2"
+  ensure_file
+  [[ "$port" =~ ^[0-9]+$ ]] || die "Port must be a number, got: '$port'"
+
+  local desc
+  desc=$(lookup "$port")
+
+  if [[ -z "$desc" ]]; then
+    echo -e "${YELLOW}Port $port:${RESET} Not in registry"
+  else
+    echo -e "${CYAN}Port $port:${RESET} ${BOLD}$desc${RESET}"
+  fi
+  [[ "$do_live" == "--live" ]] && live_check "$port"
+  return 0
+}
+
+# ── list ──────────────────────────────────────────────────────────────────────
+cmd_list() {
+  ensure_file
+  echo -e "${BOLD}Registered ports (${PORTS_FILE}):${RESET}"
+  echo ""
+  local found=0
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    local port desc
+    port=$(echo "$line" | sed -E 's/^"?([0-9]+)"?[[:space:]]*:.*/\1/')
+    desc=$(echo "$line" | sed -E 's/^"?[0-9]+"?[[:space:]]*:[[:space:]]*//')
+    printf "  ${CYAN}%-6s${RESET} %s\n" "$port" "$desc"
+    found=1
+  done < "$PORTS_FILE"
+  [[ "$found" -eq 0 ]] && echo -e "  ${YELLOW}(registry is empty — try 'portify --scan --apply')${RESET}"
+  return 0
+}
+
+# ── add a manual entry ────────────────────────────────────────────────────────
+cmd_add() {
+  local port="$1" desc="$2"
+  [[ "$port" =~ ^[0-9]+$ ]] || die "Port must be a number."
+  [[ -z "$desc" ]] && die "Usage: portify --add <port> \"description\""
+  ensure_file
+
+  if grep -qE "^\"?${port}\"?[[:space:]]*:" "$PORTS_FILE"; then
+    die "Port $port already exists. Edit $PORTS_FILE to change it."
+  fi
+  echo "${port}: ${desc}" >> "$PORTS_FILE"
+  echo -e "${GREEN}Added:${RESET} ${port}: ${desc}"
+}
+
+# ── FNV-1a 32-bit hash -> port in range 1024–65534 ───────────────────────────
+fnv1a_port() {
+  local name="${1,,}"
+  local hash=2166136261
+  local i char ord
+  for (( i=0; i<${#name}; i++ )); do
+    char="${name:$i:1}"
+    ord=$(printf '%d' "'$char")
+    hash=$(( ((hash ^ ord) * 16777619) & 0xFFFFFFFF ))
+  done
+  echo $(( 1024 + (hash % 64511) ))
+}
+
+# ── allocate: hash project -> probe for free slot -> save ─────────────────────
+cmd_allocate() {
+  local project="$1" quiet=""
+  [[ "$2" == "--quiet" || "$2" == "-q" ]] && quiet="1"
+  [[ -z "$project" ]] && die "Usage: portify --allocate <project-name> [--quiet]"
+  ensure_file
+
+  local project_lower="${project,,}"
+
+  # Idempotent: if already allocated, just return it
+  local existing_port
+  existing_port=$(grep -iE "^[0-9]+:[[:space:]]+${project_lower}[[:space:]]*$" "$PORTS_FILE" \
+    | sed -E 's/^([0-9]+):.*/\1/' | head -1)
+  if [[ -n "$existing_port" ]]; then
+    if [[ -n "$quiet" ]]; then
+      echo "$existing_port"
+    else
+      echo -e "${CYAN}Port $existing_port:${RESET} ${BOLD}$project${RESET} ${YELLOW}(already allocated)${RESET}"
+    fi
+    return
+  fi
+
+  local base_port candidate attempts=0
+  base_port=$(fnv1a_port "$project")
+  candidate=$base_port
+
+  while grep -qE "^\"?${candidate}\"?[[:space:]]*:" "$PORTS_FILE"; do
+    (( attempts++ ))
+    (( attempts > 64510 )) && die "No free ports in range 1024–65534. Registry full?"
+    (( candidate++ ))
+    (( candidate > 65534 )) && candidate=1024
+  done
+
+  echo "${candidate}: ${project}" >> "$PORTS_FILE"
+
+  if [[ -n "$quiet" ]]; then
+    echo "$candidate"
+  else
+    (( attempts > 0 )) && echo -e "${YELLOW}Note:${RESET} Port $base_port was taken; probed $attempts slot(s) forward."
+    echo -e "${GREEN}Allocated:${RESET} ${CYAN}$candidate${RESET} → ${BOLD}$project${RESET}"
+  fi
+}
+
+# ── whois: reverse lookup — port -> project name ─────────────────────────────
+cmd_whois() {
+  local port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] || die "Usage: portify --whois <port>"
+  ensure_file
+
+  local desc
+  desc=$(lookup "$port")
+  if [[ -z "$desc" ]]; then
+    echo -e "${YELLOW}Port $port:${RESET} Not in registry"
+  else
+    echo -e "${CYAN}Port $port${RESET} → ${BOLD}$desc${RESET}"
+  fi
+}
+
+# ── scan: discover ports currently listening on this machine ─────────────────
+# Emits "port<TAB>process" lines. Works with lsof (macOS/Linux) or ss (Linux).
+scan_listening() {
+  if command -v lsof &>/dev/null; then
+    lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {
+      cmd=$1; addr=$(NF-1);
+      n=split(addr, a, ":"); port=a[n];
+      if (port ~ /^[0-9]+$/) print port "\t" cmd
+    }'
+  elif command -v ss &>/dev/null; then
+    ss -tlnpH 2>/dev/null | while read -r line; do
+      addr=$(echo "$line" | awk '{print $4}')
+      port="${addr##*:}"
+      [[ "$port" =~ ^[0-9]+$ ]] || continue
+      proc=$(echo "$line" | grep -oE 'users:\(\("[^"]+' | head -1 | sed -E 's/.*"//')
+      [[ -z "$proc" ]] && proc="unknown"
+      printf '%s\t%s\n' "$port" "$proc"
+    done
+  else
+    return 1
+  fi
+}
+
+cmd_scan() {
+  local apply=""
+  [[ "$1" == "--apply" ]] && apply="1"
+  ensure_file
+  command -v lsof &>/dev/null || command -v ss &>/dev/null \
+    || die "Need 'lsof' or 'ss' to scan listening ports."
+
+  local rows
+  rows=$(scan_listening | awk -F'\t' '!seen[$1]++' | sort -n)
+  [[ -z "$rows" ]] && { echo "No listening TCP ports found."; return; }
+
+  echo -e "${BOLD}Listening TCP ports:${RESET}"
+  echo ""
+  local added=0 new=0
+  while IFS=$'\t' read -r port proc; do
+    [[ -z "$port" ]] && continue
+    local existing
+    existing=$(lookup "$port")
+    if [[ -n "$existing" ]]; then
+      printf "  ${CYAN}%-6s${RESET} %-18s ${YELLOW}(already: %s)${RESET}\n" "$port" "$proc" "$existing"
+    elif [[ -n "$apply" ]]; then
+      echo "${port}: ${proc} (auto-scanned)" >> "$PORTS_FILE"
+      printf "  ${GREEN}%-6s${RESET} %-18s ${GREEN}(added)${RESET}\n" "$port" "$proc"
+      (( added++ ))
+    else
+      printf "  ${GREEN}%-6s${RESET} %-18s ${GREEN}(new)${RESET}\n" "$port" "$proc"
+      (( new++ ))
+    fi
+  done <<< "$rows"
+
+  echo ""
+  if [[ -n "$apply" ]]; then
+    echo -e "${GREEN}Imported $added new entr$([[ $added -eq 1 ]] && echo y || echo ies).${RESET}"
+  elif (( new > 0 )); then
+    echo -e "Run ${BOLD}portify --scan --apply${RESET} to import the ${GREEN}$new${RESET} new port(s)."
+  else
+    echo -e "${GREEN}Everything listening is already in the registry.${RESET}"
+  fi
+}
+
+# ── init ──────────────────────────────────────────────────────────────────────
+cmd_init() {
+  if [[ -f "$PORTS_FILE" ]]; then
+    echo -e "${CYAN}Registry already exists:${RESET} $PORTS_FILE"
+  else
+    ensure_file
+    echo -e "${GREEN}Created:${RESET} $PORTS_FILE"
+  fi
+  echo -e "Tip: run ${BOLD}portify --scan --apply${RESET} to auto-import ports already in use."
+}
+
+usage() {
+  cat <<EOF
+${BOLD}portify${RESET} ${PORTIFY_VERSION} — port registry lookup & allocation
+
+${BOLD}Usage:${RESET}
+  portify <port>                       Look up a port
+  portify <port> --live                Look up + check if something is running
+  portify --list                       Show all registered ports
+  portify --add <port> "desc"          Add a manual entry
+  portify --allocate <project> [-q]    Auto-assign a port to a project (hash-based)
+  portify --whois <port>               Reverse lookup: port -> project name
+  portify --scan [--apply]             Discover (and optionally import) listening ports
+  portify --init                       Create an empty registry
+  portify --version                    Print version
+
+${BOLD}Allocate algorithm:${RESET}
+  FNV-1a hash of the lowercased project name, mapped to 1024–65534.
+  If the hashed port is taken, probes linearly to the next free slot.
+  Re-running with the same name is idempotent.
+  Use --quiet/-q to print just the number, e.g. in package.json scripts:
+    "dev": "vite --port \$(portify --allocate MyApp --quiet)"
+
+${BOLD}Config:${RESET}
+  Registry file: ${PORTS_FILE}
+  Override:      export PORTS_FILE=~/path/to/ports.yaml
+EOF
+}
+
+# ── dispatch ──────────────────────────────────────────────────────────────────
+case "${1:-}" in
+  --list)            cmd_list ;;
+  --add)             cmd_add "$2" "$3" ;;
+  --allocate)        cmd_allocate "$2" "$3" ;;
+  --whois)           cmd_whois "$2" ;;
+  --scan)            cmd_scan "$2" ;;
+  --init)            cmd_init ;;
+  --version|-V)      echo "portify ${PORTIFY_VERSION}" ;;
+  --help|-h)         usage ;;
+  '')                usage ;;
+  *)                 cmd_check "$1" "$2" ;;
+esac
